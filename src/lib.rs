@@ -1,5 +1,6 @@
+#![no_std]
 use core::mem::MaybeUninit;
-#[cfg(not(target_os = "solana"))]
+#[cfg(not(any(target_arch = "bpf", target_os = "solana")))]
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,6 +11,7 @@ pub enum Secp256k1RecoverError {
     RecoveryError,
 }
 
+pub const SECP256K1_RECOVERABLE_SIGNATURE_SIZE: usize = 65;
 pub const SECP256K1_SIGNATURE_SIZE: usize = 64;
 pub const SECP256K1_PUBKEY_SIZE: usize = 64;
 pub const HASH_LENGTH: usize = 32;
@@ -74,7 +76,9 @@ pub fn secp256k1_recover(
     signature: &[u8; 64],
 ) -> Result<[u8; 64], Secp256k1RecoverError> {
     // Parse the recoverable signature
-    let recoverable_signature = [signature, [u8::from(is_odd)].as_ref()].concat();
+    let mut recoverable_signature = [0u8;SECP256K1_RECOVERABLE_SIGNATURE_SIZE];
+    recoverable_signature[..SECP256K1_SIGNATURE_SIZE].clone_from_slice(signature);
+    recoverable_signature[SECP256K1_SIGNATURE_SIZE] = is_odd as u8;
 
     let signature: k256::ecdsa::recoverable::Signature =
         k256::ecdsa::recoverable::Signature::try_from(recoverable_signature.as_ref())
@@ -93,7 +97,7 @@ pub fn secp256k1_recover(
 
     unsafe {
         // Write the last 64 bytes of the uncompressed public key to the initialized memory
-        std::ptr::copy_nonoverlapping(
+        core::ptr::copy_nonoverlapping(
             recovered_key.as_ptr().add(1), // Skip the first byte (0x04 prefix)
             pubkey.as_mut_ptr() as *mut u8,
             64,
@@ -105,7 +109,7 @@ pub fn secp256k1_recover(
 }
 
 #[inline(always)]
-#[cfg(not(target_os = "solana"))]
+#[cfg(not(any(target_arch = "bpf", target_os = "solana")))]
 pub fn secp256k1_recover_unchecked(
     hash: &[u8; 32],
     is_odd: bool,
