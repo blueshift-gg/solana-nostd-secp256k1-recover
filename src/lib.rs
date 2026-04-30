@@ -1,14 +1,7 @@
-#![cfg_attr(not(test), no_std)]
+#![no_std]
 use core::mem::MaybeUninit;
 #[cfg(not(any(target_arch = "bpf", target_os = "solana")))]
 use k256::elliptic_curve::sec1::ToEncodedPoint;
-
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]

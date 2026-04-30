@@ -7,7 +7,7 @@ edition = "2021"
 license = "MIT"
 
 [lib]
-crate-type = ["cdylib", "lib"]
+crate-type = ["lib"]
 
 [target.'cfg(not(target_os = "solana"))'.dependencies]
 k256 = { version = "0.10.4", default-features = false, features = ["ecdsa"] }
