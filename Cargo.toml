@@ -1,13 +1,32 @@
 [package]
 name = "solana-nostd-secp256k1-recover"
 authors = ["Dean Little <@deanmlittle>"]
-description = "A more efficient implementation of Secp256k1 Recover for SVM"
-version = "0.1.2"
-edition = "2021"
+description = "A more efficient, no_std implementation of secp256k1 public-key recovery for the Solana SVM"
 license = "MIT"
+version = "0.3.0"
+edition = "2024"
+repository = "https://github.com/blueshift-gg/solana-nostd-secp256k1-recover"
+readme = "Readme.md"
+keywords = ["solana", "sbpf", "secp256k1", "no-std", "crypto"]
+categories = ["cryptography", "no-std"]
+exclude = [".github/", ".gitignore"]
 
 [lib]
-crate-type = ["lib"]
 
-[target.'cfg(not(target_os = "solana"))'.dependencies]
-k256 = { version = "0.10.4", default-features = false, features = ["ecdsa"] }
+[features]
+# Use the Upstream BPF/sBPFv3 static-syscall ABI (murmur3-hashed name → fn pointer
+# transmute) instead of dynamic `extern "C"` linking. Saves the PLT
+# relocation but requires a toolchain that supports static syscalls.
+static-syscalls = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
+
+[dependencies]
+solana-program-error = { version = "3", default-features = false }
+
+[dev-dependencies]
+svm-unit-test = "0.1.5"
+
+[target.'cfg(not(any(target_arch = "bpf", target_os = "solana")))'.dependencies]
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }

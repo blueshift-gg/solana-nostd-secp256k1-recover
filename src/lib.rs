@@ -1,120 +1,158 @@
+//! A more efficient, no_std secp256k1 public-key recovery for the Solana SVM.
+//!
+//! On `target_os = "solana"` or `target_arch = "bpf"`, recovery routes through
+//! the `sol_secp256k1_recover` syscall. Off-Solana, it falls through to the
+//! `k256` crate so the same APIs work in host code (tests, off-chain
+//! tooling). The Solana implementation costs ~25006 CUs, vs ~25193 CUs for
+//! `solana_program::secp256k1_recover::secp256k1_recover`.
 #![no_std]
+
 use core::mem::MaybeUninit;
+
+use solana_program_error::ProgramError;
+
 #[cfg(not(any(target_arch = "bpf", target_os = "solana")))]
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum Secp256k1RecoverError {
-    SignatureError,
-    HashError,
-    RecoveryError,
-}
-
-pub const SECP256K1_RECOVERABLE_SIGNATURE_SIZE: usize = 65;
-pub const SECP256K1_SIGNATURE_SIZE: usize = 64;
-pub const SECP256K1_PUBKEY_SIZE: usize = 64;
+/// Length of a message digest accepted by `secp256k1_recover`, in bytes.
 pub const HASH_LENGTH: usize = 32;
+/// Length of a compact (r, s) ECDSA signature, in bytes.
+pub const SECP256K1_SIGNATURE_SIZE: usize = 64;
+/// Length of an uncompressed secp256k1 public key without the 0x04 prefix.
+pub const SECP256K1_PUBKEY_SIZE: usize = 64;
+/// Length of a compact ECDSA signature plus a one-byte recovery id.
+pub const SECP256K1_RECOVERABLE_SIGNATURE_SIZE: usize = 65;
 
-#[cfg(target_os = "solana")]
-extern "C" {
+#[cfg(all(
+    any(target_arch = "bpf", target_os = "solana"),
+    not(feature = "static-syscalls")
+))]
+unsafe extern "C" {
     fn sol_secp256k1_recover(
-        hash: *const [u8; 32],
+        hash: *const u8,
         recovery_id: u64,
-        signature: *const [u8; 64],
-        result: *mut [u8; 64],
+        signature: *const u8,
+        result: *mut u8,
     ) -> u64;
 }
 
+#[cfg(all(
+    any(target_arch = "bpf", target_os = "solana"),
+    feature = "static-syscalls"
+))]
 #[inline(always)]
-#[cfg(target_os = "solana")]
+unsafe fn sol_secp256k1_recover(
+    hash: *const u8,
+    recovery_id: u64,
+    signature: *const u8,
+    result: *mut u8,
+) -> u64 {
+    // murmur3_32(b"sol_secp256k1_recover", 0) — precomputed
+    const SOL_SECP256K1_RECOVER_ID: usize = 0x17e40350;
+    let syscall: extern "C" fn(*const u8, u64, *const u8, *mut u8) -> u64 =
+        unsafe { core::mem::transmute(SOL_SECP256K1_RECOVER_ID) };
+    syscall(hash, recovery_id, signature, result)
+}
+
+/// Recover the secp256k1 public key that produced `signature` over the
+/// pre-hashed message `hash`, given the parity bit `is_odd` of the recovered
+/// y-coordinate.
+///
+/// Returns the 64-byte uncompressed public key (x ‖ y, no 0x04 prefix), or an
+/// error if the signature is malformed or no point can be recovered.
+#[cfg_attr(any(target_arch = "bpf", target_os = "solana"), inline(always))]
+#[cfg(any(target_arch = "bpf", target_os = "solana"))]
 pub fn secp256k1_recover(
-    hash: &[u8; 32],
+    hash: &[u8; HASH_LENGTH],
     is_odd: bool,
-    signature: &[u8; 64],
-) -> Result<[u8; 64], Secp256k1RecoverError> {
-    let mut out = MaybeUninit::<[u8; 64]>::uninit();
+    signature: &[u8; SECP256K1_SIGNATURE_SIZE],
+) -> Result<[u8; SECP256K1_PUBKEY_SIZE], ProgramError> {
+    let mut out = MaybeUninit::<[u8; SECP256K1_PUBKEY_SIZE]>::uninit();
     unsafe {
         if sol_secp256k1_recover(
-            hash.as_ptr() as *const [u8; 32],
+            hash.as_ptr(),
             is_odd as u64,
-            signature.as_ptr() as *const [u8; 64],
-            out.as_mut_ptr() as *mut [u8; 64],
+            signature.as_ptr(),
+            out.as_mut_ptr() as *mut u8,
         ) == 0
         {
             Ok(out.assume_init())
         } else {
-            Err(Secp256k1RecoverError::RecoveryError)
+            Err(ProgramError::InvalidArgument)
         }
     }
 }
 
-#[inline(always)]
-#[cfg(target_os = "solana")]
+/// Recover without checking the syscall return code.
+///
+/// On invalid inputs the returned bytes are unspecified. Use this only when
+/// the caller has already validated the signature, or when garbage output is
+/// acceptable (e.g. inside a larger check that compares the result against a
+/// known pubkey).
+#[cfg_attr(any(target_arch = "bpf", target_os = "solana"), inline(always))]
+#[cfg(any(target_arch = "bpf", target_os = "solana"))]
 pub fn secp256k1_recover_unchecked(
-    hash: &[u8; 32],
+    hash: &[u8; HASH_LENGTH],
     is_odd: bool,
-    signature: &[u8; 64],
-) -> [u8; 64] {
-    let mut out = MaybeUninit::<[u8; 64]>::uninit();
+    signature: &[u8; SECP256K1_SIGNATURE_SIZE],
+) -> [u8; SECP256K1_PUBKEY_SIZE] {
+    let mut out = MaybeUninit::<[u8; SECP256K1_PUBKEY_SIZE]>::uninit();
     unsafe {
         sol_secp256k1_recover(
-            hash.as_ptr() as *const [u8; 32],
+            hash.as_ptr(),
             is_odd as u64,
-            signature.as_ptr() as *const [u8; 64],
-            out.as_mut_ptr() as *mut [u8; 64],
+            signature.as_ptr(),
+            out.as_mut_ptr() as *mut u8,
         );
         out.assume_init()
     }
 }
 
-#[inline(always)]
-#[cfg(not(target_os = "solana"))]
+/// Host fallback: recover via the `k256` crate. Mirrors the on-chain return
+/// shape (64-byte uncompressed pubkey without the 0x04 prefix).
+#[cfg(not(any(target_arch = "bpf", target_os = "solana")))]
 pub fn secp256k1_recover(
-    hash: &[u8; 32],
+    hash: &[u8; HASH_LENGTH],
     is_odd: bool,
-    signature: &[u8; 64],
-) -> Result<[u8; 64], Secp256k1RecoverError> {
-    // Parse the recoverable signature
-    let mut recoverable_signature = [0u8;SECP256K1_RECOVERABLE_SIGNATURE_SIZE];
-    recoverable_signature[..SECP256K1_SIGNATURE_SIZE].clone_from_slice(signature);
-    recoverable_signature[SECP256K1_SIGNATURE_SIZE] = is_odd as u8;
+    signature: &[u8; SECP256K1_SIGNATURE_SIZE],
+) -> Result<[u8; SECP256K1_PUBKEY_SIZE], ProgramError> {
+    let parsed = Signature::from_slice(signature).map_err(|_| ProgramError::InvalidArgument)?;
 
-    let signature: k256::ecdsa::recoverable::Signature =
-        k256::ecdsa::recoverable::Signature::try_from(recoverable_signature.as_ref())
-            .map_err(|_| Secp256k1RecoverError::SignatureError)?;
+    // The on-chain syscall accepts high-S signatures, but k256's recovery
+    // path requires low-S. Normalizing flips s = n - s, which negates the
+    // recovered point's y-coordinate — so flip the parity to match.
+    let (signature, is_odd) = match parsed.normalize_s() {
+        Some(normalized) => (normalized, !is_odd),
+        None => (parsed, is_odd),
+    };
 
-    // Recover the public key from the signature and message hash
-    let binding = signature
-        .recover_verify_key_from_digest_bytes(hash.into())
-        .map_err(|_| Secp256k1RecoverError::RecoveryError)?
-        .to_encoded_point(false);
+    let recovery_id =
+        RecoveryId::try_from(is_odd as u8).map_err(|_| ProgramError::InvalidArgument)?;
 
-    let recovered_key = binding.as_bytes();
+    let verifying_key = VerifyingKey::recover_from_prehash(hash, &signature, recovery_id)
+        .map_err(|_| ProgramError::InvalidArgument)?;
 
-    // Use MaybeUninit to initialize the array
-    let mut pubkey = MaybeUninit::<[u8; 64]>::uninit();
+    let encoded = verifying_key.to_encoded_point(false);
+    let recovered = encoded.as_bytes();
 
+    let mut pubkey = MaybeUninit::<[u8; SECP256K1_PUBKEY_SIZE]>::uninit();
     unsafe {
-        // Write the last 64 bytes of the uncompressed public key to the initialized memory
+        // Skip the leading 0x04 uncompressed-point tag.
         core::ptr::copy_nonoverlapping(
-            recovered_key.as_ptr().add(1), // Skip the first byte (0x04 prefix)
+            recovered.as_ptr().add(1),
             pubkey.as_mut_ptr() as *mut u8,
-            64,
+            SECP256K1_PUBKEY_SIZE,
         );
-
-        // Return the safely initialized 64-byte array
         Ok(pubkey.assume_init())
     }
 }
 
-#[inline(always)]
 #[cfg(not(any(target_arch = "bpf", target_os = "solana")))]
 pub fn secp256k1_recover_unchecked(
-    hash: &[u8; 32],
+    hash: &[u8; HASH_LENGTH],
     is_odd: bool,
-    signature: &[u8; 64],
-) -> [u8; 64] {
+    signature: &[u8; SECP256K1_SIGNATURE_SIZE],
+) -> [u8; SECP256K1_PUBKEY_SIZE] {
     secp256k1_recover(hash, is_odd, signature).unwrap()
 }
 
@@ -123,15 +161,13 @@ mod tests {
     use crate::*;
 
     #[test]
-    fn test_hash() {
-        // Example 32-byte precomputed message digest (e.g., the result of a SHA-256 hash)
+    fn test_recover() {
         let message_digest: [u8; 32] = [
             0x6b, 0x37, 0x78, 0xa6, 0x4f, 0x26, 0x75, 0xf3, 0xf7, 0x6b, 0xf9, 0xf3, 0x5a, 0xf1,
             0xfc, 0x67, 0x37, 0x59, 0xed, 0x17, 0xae, 0xd8, 0x6d, 0xd5, 0x6c, 0xa3, 0x6c, 0x2b,
             0xfd, 0x7e, 0xb0, 0xf9,
         ];
 
-        // This is an example; in real use cases, you'll have this from signing.
         let signature_bytes: [u8; 64] = [
             0xd0, 0x34, 0xc9, 0x8a, 0xf3, 0x27, 0x4a, 0xd9, 0x3f, 0x3c, 0x8c, 0xe9, 0x44, 0xbb,
             0xc1, 0x7b, 0x11, 0xb6, 0xaa, 0x17, 0x0c, 0x5f, 0x09, 0x7e, 0xd9, 0x86, 0x87, 0xfa,
@@ -149,11 +185,9 @@ mod tests {
         ];
 
         let key = secp256k1_recover(&message_digest, true, &signature_bytes).unwrap();
-
         assert_eq!(key, pubkey_bytes);
 
         let key = secp256k1_recover(&message_digest, false, &signature_bytes).unwrap();
-
-        assert_ne!(key, pubkey_bytes)
+        assert_ne!(key, pubkey_bytes);
     }
 }
